@@ -8,6 +8,17 @@ from StreamDiffusionWrapper import StreamDiffusionWrapper
 from .interface import Pipeline
 
 
+class ControlNetConfig(BaseModel):
+    """Configuration for a single ControlNet"""
+    model_id: str = "thibaud/controlnet-sd21-depth-diffusers"
+    preprocessor: str = "depth_tensorrt"
+    conditioning_scale: float = 0.5
+    enabled: bool = True
+    control_guidance_start: float = 0.0
+    control_guidance_end: float = 1.0
+    preprocessor_params: Optional[Dict] = None
+
+
 class ControlNetStreamDiffusionParams(BaseModel):
     class Config:
         extra = "forbid"
@@ -28,23 +39,28 @@ class ControlNetStreamDiffusionParams(BaseModel):
     guidance_scale: float = 1.1
     do_add_noise: bool = True
     similar_image_filter_threshold: float = 0.98
-    
-    # ControlNet specific parameters
-    controlnet_model: str = "thibaud/controlnet-sd21-depth-diffusers"
-    controlnet_preprocessor: str = "depth_tensorrt"
-    controlnet_strength: float = 0.5
     negative_prompt: str = "blurry, low quality, flat, 2d"
     
-    # TensorRT engine path for depth preprocessing
-    tensorrt_engine_path: Optional[str] = None
+    # Multiple ControlNets configuration
+    controlnets: List[ControlNetConfig] = [
+        ControlNetConfig(
+            model_id="thibaud/controlnet-sd21-depth-diffusers",
+            preprocessor="depth_tensorrt",
+            conditioning_scale=0.5,
+            enabled=True
+        )
+    ]
+    
+    # Pipeline type for ControlNet patching
+    pipeline_type: str = "sdturbo"
     
 
 class ControlNetStreamDiffusion(Pipeline):
     """
-    ControlNet-enabled StreamDiffusion pipeline for ai-runner.
+    Multi-ControlNet StreamDiffusion pipeline for ai-runner.
     
-    Extends the base StreamDiffusion implementation with ControlNet conditioning.
-    Follows ai-runner patterns exactly for seamless integration.
+    Supports multiple ControlNets with independent strength controls.
+    Uses list of dicts configuration pattern to match updated StreamDiffusion examples.
     """
     
     def __init__(self, **params):
@@ -80,9 +96,10 @@ class ControlNetStreamDiffusion(Pipeline):
                 return
 
         logging.info(f"ControlNetStreamDiffusion: Resetting pipeline for params change")
+        logging.info(f"ControlNetStreamDiffusion: Configured with {len(new_params.controlnets)} ControlNets")
         
-        # Create ControlNet configuration
-        controlnet_config = self._create_controlnet_config(new_params)
+        # Create ControlNet configurations list
+        controlnet_configs = self._create_controlnet_configs(new_params)
         
         # Initialize StreamDiffusionWrapper with ControlNet support
         pipe = StreamDiffusionWrapper(
@@ -102,9 +119,9 @@ class ControlNetStreamDiffusion(Pipeline):
             similar_image_filter_threshold=new_params.similar_image_filter_threshold,
             use_denoising_batch=new_params.use_denoising_batch,
             seed=new_params.seed,
-            # ControlNet parameters
+            # Multi-ControlNet parameters
             use_controlnet=True,
-            controlnet_config=controlnet_config,
+            controlnet_config=controlnet_configs,  # Now expects a list
         )
         
         # Prepare the pipeline
@@ -119,37 +136,96 @@ class ControlNetStreamDiffusion(Pipeline):
         self.pipe = pipe
         self.first_frame = True
         
-        logging.info("ControlNetStreamDiffusion: Pipeline ready for inference")
+        logging.info("ControlNetStreamDiffusion: Multi-ControlNet pipeline ready for inference")
 
-    def _create_controlnet_config(self, params: ControlNetStreamDiffusionParams) -> dict:
-        """Create ControlNet configuration dictionary"""
-        config = {
-            'model_id': params.controlnet_model,
-            'preprocessor': params.controlnet_preprocessor,
-            'conditioning_scale': params.controlnet_strength,
-            'enabled': True,
-            'pipeline_type': 'sdturbo',  # Hardcoded for SD Turbo optimization
-            'control_guidance_start': 0.0,
-            'control_guidance_end': 1.0,
-        }
+    def _create_controlnet_configs(self, params: ControlNetStreamDiffusionParams) -> List[dict]:
+        """Create list of ControlNet configuration dictionaries"""
+        configs = []
         
-        # Add TensorRT engine path for depth preprocessing if provided
-        if params.tensorrt_engine_path and params.controlnet_preprocessor == "depth_tensorrt":
-            config['preprocessor_params'] = {
-                'engine_path': params.tensorrt_engine_path,
-                'detect_resolution': 518,
-                'image_resolution': 512
+        for cn_config in params.controlnets:
+            config = {
+                'model_id': cn_config.model_id,
+                'preprocessor': cn_config.preprocessor,
+                'conditioning_scale': cn_config.conditioning_scale,
+                'enabled': cn_config.enabled,
+                'pipeline_type': params.pipeline_type,
+                'control_guidance_start': cn_config.control_guidance_start,
+                'control_guidance_end': cn_config.control_guidance_end,
             }
+            
+            # Add preprocessor params if provided
+            if cn_config.preprocessor_params:
+                config['preprocessor_params'] = cn_config.preprocessor_params
+            
+            configs.append(config)
+            
+            logging.info(f"ControlNetStreamDiffusion: Added ControlNet - {cn_config.model_id} ({cn_config.preprocessor}) strength={cn_config.conditioning_scale}")
         
-        return config
+        return configs
+    
+    def update_controlnet_strength(self, index: int, strength: float):
+        """Update strength of a specific ControlNet by index"""
+        if self.pipe and hasattr(self.pipe, 'update_controlnet_scale'):
+            try:
+                self.pipe.update_controlnet_scale(index, strength)
+                logging.info(f"ControlNetStreamDiffusion: Updated ControlNet {index} strength to {strength}")
+                
+                # Update params to keep in sync
+                if hasattr(self, 'params') and index < len(self.params.controlnets):
+                    self.params.controlnets[index].conditioning_scale = strength
+                    
+            except Exception as e:
+                logging.error(f"ControlNetStreamDiffusion: Failed to update ControlNet {index} strength: {e}")
+    
+    def toggle_controlnet(self, index: int, enabled: bool):
+        """Enable/disable a specific ControlNet by index"""
+        if self.pipe and hasattr(self.pipe, 'update_controlnet_scale'):
+            try:
+                # Set strength to configured value if enabling, 0 if disabling
+                if hasattr(self, 'params') and index < len(self.params.controlnets):
+                    strength = self.params.controlnets[index].conditioning_scale if enabled else 0.0
+                    self.pipe.update_controlnet_scale(index, strength)
+                    self.params.controlnets[index].enabled = enabled
+                    
+                    logging.info(f"ControlNetStreamDiffusion: {'Enabled' if enabled else 'Disabled'} ControlNet {index}")
+                    
+            except Exception as e:
+                logging.error(f"ControlNetStreamDiffusion: Failed to toggle ControlNet {index}: {e}")
+    
+    def get_controlnet_info(self) -> List[Dict]:
+        """Get information about all configured ControlNets"""
+        if not hasattr(self, 'params'):
+            return []
+            
+        info = []
+        for i, cn_config in enumerate(self.params.controlnets):
+            info.append({
+                'index': i,
+                'model_id': cn_config.model_id,
+                'preprocessor': cn_config.preprocessor,
+                'strength': cn_config.conditioning_scale,
+                'enabled': cn_config.enabled,
+                'guidance_start': cn_config.control_guidance_start,
+                'guidance_end': cn_config.control_guidance_end,
+            })
+        return info
     
     def get_health(self) -> dict:
         """Health check method following ai-runner patterns"""
-        return {
+        health = {
             "status": "OK" if self.pipe else "LOADING",
             "pipeline": "controlnet_streamdiffusion",
             "model_id": self.params.model_id if hasattr(self, 'params') else "unknown"
         }
+        
+        if hasattr(self, 'params'):
+            health["controlnets"] = len(self.params.controlnets)
+            health["controlnet_info"] = self.get_controlnet_info()
+            
+        return health
     
     def __str__(self) -> str:
-        return f"ControlNetStreamDiffusion model_id={getattr(self.params, 'model_id', 'unknown')}" 
+        if hasattr(self, 'params'):
+            num_controlnets = len(self.params.controlnets)
+            return f"ControlNetStreamDiffusion model_id={self.params.model_id} controlnets={num_controlnets}"
+        return "ControlNetStreamDiffusion model_id=unknown" 
